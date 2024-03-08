@@ -59,3 +59,14 @@ if __name__ == '__main__':
     plan = text_format.Parse(PLAN_PROTOTEXT, plan_pb2.Plan())
     table = execute_with_duckdb_over_adbc(plan)
     print(table)
+
+
+# This currently produces the following output:
+#      File "adbc_driver_manager/_lib.pyx", line 1483, in adbc_driver_manager._lib.AdbcStatement.set_substrait_plan
+#   File "adbc_driver_manager/_lib.pyx", line 237, in adbc_driver_manager._lib.check_error
+# adbc_driver_manager.InternalError: INTERNAL: Parser Error: unterminated quoted string at or near "'EC
+# A
+# ?
+# 
+# "
+# LINE 1: CALL from_substrait('EC
