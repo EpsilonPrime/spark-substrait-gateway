@@ -171,8 +171,8 @@ def mark_dataframe_tests_as_xfail(request):
 class TestDataFrameAPI:
     """Tests of the dataframe side of SparkConnect."""
 
-    def test_collect(self, users_dataframe):
-        with utilizes_valid_plans(users_dataframe):
+    def test_collect(self, users_dataframe, caplog):
+        with utilizes_valid_plans(users_dataframe, caplog):
             outcome = users_dataframe.collect()
 
         assert len(outcome) == 100
@@ -538,7 +538,7 @@ only showing top 1 row
 
         df = create_parquet_table(spark_session, "mytesttable", table)
 
-        with utilizes_valid_plans(df):
+        with utilizes_valid_plans(df, caplog):
             outcome = df.select(df.r.getField("b"), df.r.a).collect()
 
         assertDataFrameEqual(outcome, expected)
@@ -552,7 +552,7 @@ only showing top 1 row
         map_array = pa.array([{"key": "value"}], type=pa.map_(pa.string(), pa.string(), False))
         table = pa.Table.from_arrays([list_array, map_array], names=["l", "d"])
 
-        df = create_parquet_table(spark_session, "mytesttable", table)
+        df = create_parquet_table(spark_session, "mystructtable", table)
 
         with utilizes_valid_plans(df):
             outcome = df.select(df.l.getItem(0), df.d.getItem("key")).collect()
@@ -575,7 +575,7 @@ only showing top 1 row
 
         assertDataFrameEqual(outcome, expected)
 
-    def test_join(self, register_tpch_dataset, spark_session):
+    def test_join(self, register_tpch_dataset, spark_session, caplog):
         expected = [
             Row(
                 n_nationkey=5,
@@ -592,7 +592,7 @@ only showing top 1 row
             ),
         ]
 
-        with utilizes_valid_plans(spark_session):
+        with utilizes_valid_plans(spark_session, caplog):
             nation = spark_session.table("nation")
             supplier = spark_session.table("supplier")
 
@@ -974,7 +974,7 @@ only showing top 1 row
         int_array = pa.array([221, 0, 42, None], type=pa.int64())
         table = pa.Table.from_arrays([int_array], names=["i"])
 
-        df = create_parquet_table(spark_session, "mytesttable", table)
+        df = create_parquet_table(spark_session, "mytesttable3", table)
 
         with utilizes_valid_plans(df):
             outcome = df.select(

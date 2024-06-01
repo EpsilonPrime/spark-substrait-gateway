@@ -27,6 +27,8 @@ from gateway.converter.conversion_options import arrow, datafusion, duck_db
 from gateway.converter.spark_to_substrait import SparkSubstraitConverter
 from gateway.security import BearerTokenAuthInterceptor
 
+from src.gateway.converter.conversion_options import ConversionOptions
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -189,6 +191,7 @@ class Statistics:
 
     def reset(self):
         """Reset the statistics."""
+        # TODO -- Consider removing this (and all calls to this).
         self.config_requests = 0
         self.analyze_requests = 0
         self.execute_requests = 0
@@ -203,6 +206,58 @@ class Statistics:
         self.plans = []
 
 
+class ExecutionDetails:
+    """Execution related classes for a given session."""
+
+    def __init__(self):
+        self.backend: Backend | None = None
+        self.sql_backend: Backend | None = None
+        self.converter: SparkSubstraitConverter | None = None
+        self.statistics = Statistics()
+
+    def initialize(self, options: ConversionOptions):
+        """Initialize the execution of the Plan by setting the backend."""
+        if not self.backend:
+            self.backend = find_backend(options.backend)
+            self.sql_backend = find_backend(BackendOptions(BackendEngine.DUCKDB, False))
+            self.converter = SparkSubstraitConverter(options)
+            self.converter.set_backends(self.backend, self.sql_backend)
+
+    def reset(self) -> None:
+        """Reinitialize the current execution by resetting the backends."""
+        self.statistics.database_resets += 1
+        self.backend.reset_connection()
+        self.sql_backend.reset_connection()
+
+    def remove_backends(self):
+        if self.backend:
+            self.backend.close()
+            self.backend = None
+            self.sql_backend.close()
+            self.sql_backend = None
+            self.converter = None
+
+
+class ExecutionFactory:
+    """Provides an ExecutionDetails per session id."""
+
+    def __init__(self):
+        self._session_info: dict[str, ExecutionDetails] = {}
+
+    def get(self, session_id: str) -> ExecutionDetails:
+        if session_id not in self._session_info:
+            self._session_info[session_id] = ExecutionDetails()
+            print('Created new execution for session:', session_id)
+        else:
+            print('Used existing execution for session:', session_id)
+        return self._session_info.get(session_id)
+
+    def release(self, session_id: str) -> None:
+        if session_id in self._session_info:
+            self._session_info[session_id].remove_backends()
+            # TODO -- Schedule the execution to be removed after some time.
+
+
 # pylint: disable=E1101,fixme
 class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
     """Provides the SparkConnect service."""
@@ -212,44 +267,26 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
         """Initialize the SparkConnect service."""
         # This is the central point for configuring the behavior of the service.
         self._options = duck_db()
-        self._backend: Backend | None = None
-        self._sql_backend: Backend | None = None
-        self._converter = None
-        self._statistics = Statistics()
 
-    def _InitializeExecution(self) -> None:
-        """Initialize the execution of the Plan by setting the backend."""
-        if not self._backend:
-            self._backend = find_backend(self._options.backend)
-            self._sql_backend = find_backend(BackendOptions(BackendEngine.DUCKDB, False))
-            self._converter = SparkSubstraitConverter(self._options)
-            self._converter.set_backends(self._backend, self._sql_backend)
-
-    def _ReinitializeExecution(self) -> None:
-        """Reinitialize the execution of the Plan by resetting the backend."""
-        self._statistics.database_resets += 1
-        if not self._backend:
-            return self._InitializeExecution()
-        self._backend.reset_connection()
-        self._sql_backend.reset_connection()
-        return None
+        self._execution = ExecutionFactory()
 
     def ExecutePlan(
         self, request: pb2.ExecutePlanRequest, context: grpc.RpcContext
     ) -> Generator[pb2.ExecutePlanResponse, None, None]:
         """Execute the given plan and return the results."""
-        self._statistics.execute_requests += 1
-        self._statistics.add_request(request)
+        execution = self._execution.get(request.session_id)
+        execution.statistics.execute_requests += 1
+        execution.statistics.add_request(request)
         _LOGGER.info("ExecutePlan: %s", request)
-        self._InitializeExecution()
+        execution.initialize(self._options)
         match request.plan.WhichOneof("op_type"):
             case "root":
-                substrait = self._converter.convert_plan(request.plan)
+                substrait = execution.converter.convert_plan(request.plan)
             case "command":
                 match request.plan.command.WhichOneof("command_type"):
                     case "sql_command":
                         if "CREATE" in request.plan.command.sql_command.sql:
-                            connection = self._backend.get_connection()
+                            connection = execution.backend.get_connection()
                             connection.execute(request.plan.command.sql_command.sql)
                             yield pb2.ExecutePlanResponse(
                                 session_id=request.session_id,
@@ -257,23 +294,18 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
                             )
                             return
                         try:
-                            substrait = self._sql_backend.convert_sql(
-                                request.plan.command.sql_command.sql
-                            )
+                            substrait = execution.sql_backend.convert_sql(
+                                request.plan.command.sql_command.sql)
                         except Exception as err:
-                            self._ReinitializeExecution()
+                            execution.reset()
                             raise err
                     case "create_dataframe_view":
-                        create_dataframe_view(
-                            request.session_id,
-                            request.plan.command.create_dataframe_view,
-                            self._backend,
-                        )
-                        create_dataframe_view(
-                            request.session_id,
-                            request.plan.command.create_dataframe_view,
-                            self._sql_backend,
-                        )
+                        create_dataframe_view(request.session_id,
+                                              request.plan.command.create_dataframe_view,
+                                              execution.backend)
+                        create_dataframe_view(request.session_id,
+                                              request.plan.command.create_dataframe_view,
+                                              execution.sql_backend)
                         yield pb2.ExecutePlanResponse(
                             session_id=request.session_id,
                             result_complete=pb2.ExecutePlanResponse.ResultComplete(),
@@ -285,11 +317,11 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
             case _:
                 raise ValueError(f"Unknown plan type: {request.plan}")
         _LOGGER.debug("  as Substrait: %s", substrait)
-        self._statistics.add_plan(substrait)
+        execution.statistics.add_plan(substrait)
         try:
-            results = self._backend.execute(substrait)
+            results = execution.backend.execute(substrait)
         except Exception as err:
-            self._ReinitializeExecution()
+            execution.reset()
             raise err
         _LOGGER.debug("  results are: %s", results)
 
@@ -335,29 +367,27 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
 
     def AnalyzePlan(self, request, context):
         """Analyze the given plan and return the results."""
-        self._statistics.analyze_requests += 1
-        self._statistics.add_request(request)
+        execution = self._execution.get(request.session_id)
+        execution.statistics.analyze_requests += 1
+        execution.statistics.add_request(request)
         _LOGGER.info("AnalyzePlan: %s", request)
-        self._InitializeExecution()
+        execution.initialize(self._options)
         match request.WhichOneof("analyze"):
-            case 'schema':
-                substrait = self._converter.convert_plan(request.schema.plan)
-                self._statistics.add_plan(substrait)
-                if len(substrait.relations) != 1:
-                    raise ValueError(f"Expected exactly _ONE_ relation in the plan: {request}")
+            case "schema":
+                substrait = execution.converter.convert_plan(request.schema.plan)
+                execution.statistics.add_plan(substrait)
                 try:
-                    results = self._backend.execute(substrait)
+                    results = execution.backend.execute(substrait)
                 except Exception as err:
+                    execution.mark_failed()
                     self._ReinitializeExecution()
                     raise err
                 _LOGGER.debug("  results are: %s", results)
                 return pb2.AnalyzePlanResponse(
                     session_id=request.session_id,
-                    schema=pb2.AnalyzePlanResponse.Schema(
-                        schema=convert_pyarrow_schema_to_spark(results.schema)
-                    ),
-                )
-            case 'is_streaming':
+                    schema=pb2.AnalyzePlanResponse.Schema(schema=convert_pyarrow_schema_to_spark(
+                        results.schema)))
+            case "is_streaming":
                 # TODO -- Actually look at the plan (this path is used by pyspark.testing.utils).
                 return pb2.AnalyzePlanResponse(
                     session_id=request.session_id,
@@ -372,7 +402,8 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
 
     def Config(self, request, context):
         """Get or set the configuration of the server."""
-        self._statistics.config_requests += 1
+        execution = self._execution.get(request.session_id)
+        execution.statistics.config_requests += 1
         _LOGGER.info("Config: %s", request)
         response = pb2.ConfigResponse(session_id=request.session_id)
         match request.operation.WhichOneof("op_type"):
@@ -389,34 +420,35 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
                                 self._options = datafusion()
                             case _:
                                 raise ValueError(f"Unknown backend: {pair.value}")
-                    elif pair.key == "spark-substrait-gateway.reset_statistics":
-                        self._statistics.reset()
                 response.pairs.extend(request.operation.set.pairs)
             case "get":
                 for key in request.operation.get.keys:
                     if key == "spark-substrait-gateway.backend":
                         response.pairs.add(key=key, value=str(self._options.backend.backend))
                     elif key == "spark-substrait-gateway.plan_count":
-                        response.pairs.add(key=key, value=str(len(self._statistics.plans)))
+                        response.pairs.add(key=key, value=str(len(execution.statistics.plans)))
                     elif key.startswith("spark-substrait-gateway.plan."):
-                        index = int(key[len("spark-substrait-gateway.plan.") :])
-                        if 0 <= index - 1 < len(self._statistics.plans):
-                            response.pairs.add(key=key, value=self._statistics.plans[index - 1])
+                        index = int(key[len("spark-substrait-gateway.plan."):])
+                        if 0 <= index - 1 < len(execution.statistics.plans):
+                            response.pairs.add(key=key, value=execution.statistics.plans[index - 1])
+                    elif key == "spark-substrait-gateway.request_count":
+                        response.pairs.add(key=key, value=str(len(execution.statistics.requests)))
+                    elif key.startswith("spark-substrait-gateway.request."):
+                        index = int(key[len("spark-substrait-gateway.request."):])
+                        if 0 <= index - 1 < len(execution.statistics.plans):
+                            response.pairs.add(
+                                key=key, value=execution.statistics.requests[index - 1])
                     elif key == "spark.sql.session.timeZone":
                         response.pairs.add(key=key, value="UTC")
-                    elif key in [
-                        "spark.sql.pyspark.inferNestedDictAsStruct.enabled",
-                        "spark.sql.repl.eagerEval.enabled",
-                        "spark.sql.repl.eagerEval.truncate",
-                        "spark.sql.pyspark.legacy.inferArrayTypeFromFirstElement.enabled",
-                    ]:
+                    elif key in ["spark.sql.pyspark.inferNestedDictAsStruct.enabled",
+                                 "spark.sql.repl.eagerEval.enabled",
+                                 "spark.sql.repl.eagerEval.truncate",
+                                 "spark.sql.pyspark.legacy.inferArrayTypeFromFirstElement.enabled"]:
                         response.pairs.add(key=key, value="false")
                     elif key == "spark.sql.timestampType":
                         response.pairs.add(key=key, value="TIMESTAMP_NTZ")
-                    elif key in [
-                        "spark.sql.session.localRelationCacheThreshold",
-                        "spark.sql.repl.eagerEval.maxNumRows",
-                    ]:
+                    elif key in ["spark.sql.session.localRelationCacheThreshold",
+                                 "spark.sql.repl.eagerEval.maxNumRows"]:
                         response.pairs.add(key=key, value="9999")
                     elif key == "spark-substrait-gateway.use_duckdb_struct_name_behavior":
                         response.pairs.add(
@@ -451,7 +483,8 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
 
     def AddArtifacts(self, request_iterator, context):
         """Add the given artifacts to the server."""
-        self._statistics.add_artifacts_requests += 1
+        execution = self._execution.get(request_iterator.session_id)
+        execution.statistics.add_artifacts_requests += 1
         _LOGGER.info("AddArtifacts")
         response = pb2.AddArtifactsResponse()
         for request in request_iterator:
@@ -466,7 +499,8 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
 
     def ArtifactStatus(self, request, context):
         """Get the status of the given artifact."""
-        self._statistics.artifact_status_requests += 1
+        execution = self._execution.get(request.session_id)
+        execution.statistics.artifact_status_requests += 1
         _LOGGER.info("ArtifactStatus")
         return pb2.ArtifactStatusesResponse()
 
@@ -480,7 +514,8 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
         self, request: pb2.ReattachExecuteRequest, context: grpc.RpcContext
     ) -> Generator[pb2.ExecutePlanResponse, None, None]:
         """Reattach the execution of the given plan."""
-        self._statistics.reattach_requests += 1
+        execution = self._execution.get(request.session_id)
+        execution.statistics.reattach_requests += 1
         _LOGGER.info("ReattachExecute")
         yield pb2.ExecutePlanResponse(
             session_id=request.session_id, result_complete=pb2.ExecutePlanResponse.ResultComplete()
@@ -488,8 +523,10 @@ class SparkConnectService(pb2_grpc.SparkConnectServiceServicer):
 
     def ReleaseExecute(self, request, context):
         """Release the execution of the given plan."""
-        self._statistics.release_requests += 1
+        execution = self._execution.get(request.session_id)
+        execution.statistics.release_requests += 1
         _LOGGER.info("ReleaseExecute")
+        self._execution.release(request.session_id)
         return pb2.ReleaseExecuteResponse()
 
 
